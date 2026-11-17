@@ -17,7 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -43,6 +43,7 @@ const MAX_DELIVERY_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 524_288;
 const MAX_STATE_FILES: usize = 65_536;
+const DELIVERED_STATE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 // The executable identity is stable for this process; avoid hashing the full binary for every profile request.
 static EXECUTABLE_PROVENANCE: tokio::sync::OnceCell<ProfileProvenance> = tokio::sync::OnceCell::const_new();
@@ -76,12 +77,22 @@ enum JobState {
 #[derive(Clone)]
 struct JobStateStore {
     directory: PathBuf,
+    // Serialize state-file operations so the file-count check, pruning and atomic
+    // replacement form one process-local critical section.
+    operation_lock: Arc<Mutex<()>>,
+    // Count .json records once per process, then maintain it with successful
+    // creates/removals. This avoids a directory scan on every offered job.
+    state_file_count_cache: Arc<Mutex<Option<usize>>>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct UploadedDiagnosticJobResult {
     job_id: String,
+    // Persist the idempotency key before the first network request. Option keeps
+    // compatibility with Uploaded state files written by older Agent v1 builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
     outcome: String,
     reason: String,
     artifact_name: Option<String>,
@@ -117,6 +128,8 @@ impl DiagnosticJobRuntime {
             deliveries: DeliveryRegistry::default(),
             store: JobStateStore {
                 directory: state_root.join("diagnostic-jobs"),
+                operation_lock: Arc::new(Mutex::new(())),
+                state_file_count_cache: Arc::new(Mutex::new(None)),
             },
         })
     }
@@ -156,10 +169,7 @@ impl DiagnosticJobRuntime {
                         states.insert(job_id.clone(), JobState::Completed(result.clone()));
                         Some(result)
                     }
-                    Ok(Some(JobState::Delivered)) => {
-                        states.insert(job_id, JobState::Delivered);
-                        return;
-                    }
+                    Ok(Some(JobState::Delivered)) => return,
                     Ok(Some(JobState::Uploaded(result))) => {
                         if !valid_uploaded_result(&result, &job_id) {
                             return;
@@ -183,8 +193,17 @@ impl DiagnosticJobRuntime {
                         Some(result)
                     }
                     Ok(None) => {
-                        if self.store.save(&job_id, &JobState::Active).is_err() {
-                            return;
+                        let evicted = match self.store.save_new(&job_id, &JobState::Active) {
+                            Ok(evicted) => evicted,
+                            Err(()) => {
+                                tracing::error!(job_id = %job_id, "failed to persist initial diagnostic job state; job was not executed");
+                                return;
+                            }
+                        };
+                        // Keep the in-memory replay cache consistent with Delivered
+                        // records reclaimed from the persistent store at capacity.
+                        for evicted_job_id in evicted {
+                            states.remove(&evicted_job_id);
                         }
                         states.insert(job_id.clone(), JobState::Active);
                         None
@@ -207,10 +226,12 @@ impl DiagnosticJobRuntime {
                         Err(reason) => failed_execution(&job_id, reason),
                     };
                     let terminal = JobState::Completed(result.clone());
-                    if runtime.store.save(&job_id, &terminal).is_ok()
-                        && let Ok(mut states) = runtime.states.lock()
-                    {
-                        states.insert(job_id.clone(), terminal);
+                    if runtime.store.save(&job_id, &terminal).is_ok() {
+                        if let Ok(mut states) = runtime.states.lock() {
+                            states.insert(job_id.clone(), terminal);
+                        }
+                    } else {
+                        tracing::error!(job_id = %job_id, "failed to persist completed diagnostic job state");
                     }
                     result
                 }
@@ -221,16 +242,34 @@ impl DiagnosticJobRuntime {
         });
     }
 
-    async fn deliver_uploaded(&self, result: UploadedDiagnosticJobResult, expire_time: &str, cancel: &CancellationToken) {
+    async fn deliver_uploaded(&self, mut result: UploadedDiagnosticJobResult, expire_time: &str, cancel: &CancellationToken) {
         let job_id = result.job_id.clone();
         let Some(_lease) = self.deliveries.acquire(&job_id) else {
             return;
         };
-        if deliver_result(&self.config, &result, expire_time, cancel).await
-            && self.store.save(&job_id, &JobState::Delivered).is_ok()
-            && let Ok(mut states) = self.states.lock()
-        {
-            states.insert(job_id, JobState::Delivered);
+        // Older persisted Uploaded records do not contain requestId. Migrate them
+        // atomically before sending so a crash after server acceptance cannot cause
+        // a retry with a new idempotency key.
+        if self.store.ensure_delivery_request_id(&mut result).is_err() {
+            tracing::warn!(job_id = %job_id, "failed to persist diagnostic result request id");
+            return;
+        }
+        if let Ok(mut states) = self.states.lock() {
+            states.insert(job_id.clone(), JobState::Uploaded(result.clone()));
+        }
+        if deliver_result(&self.config, &result, expire_time, cancel).await {
+            if self.store.save(&job_id, &JobState::Delivered).is_ok() {
+                // Persisted Delivered records are the replay barrier. Do not keep
+                // them in the in-memory map: that map should remain bounded as old
+                // Delivered records are eventually pruned from disk.
+                if let Ok(mut states) = self.states.lock() {
+                    states.remove(&job_id);
+                }
+            } else {
+                // Keep the Uploaded state (and its persisted requestId) so a restart
+                // retries with the same idempotency key instead of executing again.
+                tracing::error!(job_id = %job_id, "result accepted but Delivered state could not be persisted; preserving Uploaded state for safe retry");
+            }
         }
     }
 }
@@ -262,6 +301,11 @@ impl JobStateStore {
     }
 
     fn load(&self, job_id: &str) -> Result<Option<JobState>, ()> {
+        let _guard = self.operation_lock.lock().map_err(|_| ())?;
+        self.load_unlocked(job_id)
+    }
+
+    fn load_unlocked(&self, job_id: &str) -> Result<Option<JobState>, ()> {
         let path = self.path(job_id);
         let initial = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -289,33 +333,167 @@ impl JobStateStore {
     }
 
     fn save(&self, job_id: &str, state: &JobState) -> Result<(), ()> {
-        let bytes = serde_json::to_vec(state).map_err(|_| ())?;
-        if bytes.is_empty() || u64::try_from(bytes.len()).map_err(|_| ())? > MAX_STATE_BYTES {
+        let _guard = self.operation_lock.lock().map_err(|_| ())?;
+        self.ensure_directory()?;
+        let destination = self.path(job_id);
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_file() => self.write_state_unlocked(job_id, state),
+            // State transitions must update an existing record. A missing state is
+            // not silently recreated because doing so could bypass replay control.
+            Ok(_) => Err(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(()),
+            Err(_) => Err(()),
+        }
+    }
+
+    fn save_new(&self, job_id: &str, state: &JobState) -> Result<Vec<String>, ()> {
+        let _guard = self.operation_lock.lock().map_err(|_| ())?;
+        self.save_new_unlocked(job_id, state, MAX_STATE_FILES)
+    }
+
+    #[cfg(test)]
+    fn save_new_with_limit(&self, job_id: &str, state: &JobState, max_state_files: usize) -> Result<Vec<String>, ()> {
+        let _guard = self.operation_lock.lock().map_err(|_| ())?;
+        self.save_new_unlocked(job_id, state, max_state_files)
+    }
+
+    fn save_new_unlocked(&self, job_id: &str, state: &JobState, max_state_files: usize) -> Result<Vec<String>, ()> {
+        if max_state_files == 0 {
             return Err(());
         }
         self.ensure_directory()?;
         let destination = self.path(job_id);
-        if !destination.exists() && self.state_file_count()? >= MAX_STATE_FILES {
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => return Err(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(()),
+        }
+
+        let mut evicted = Vec::new();
+        if self.cached_state_file_count_unlocked()? >= max_state_files {
+            let cutoff = SystemTime::now()
+                .checked_sub(DELIVERED_STATE_RETENTION)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            evicted = self.prune_delivered_before_unlocked(cutoff)?;
+            if self.cached_state_file_count_unlocked()? >= max_state_files {
+                return Err(());
+            }
+        }
+
+        self.write_state_unlocked(job_id, state)?;
+        self.adjust_cached_state_file_count_unlocked(1)?;
+        Ok(evicted)
+    }
+
+    fn write_state_unlocked(&self, job_id: &str, state: &JobState) -> Result<(), ()> {
+        let bytes = serde_json::to_vec(state).map_err(|_| ())?;
+        if bytes.is_empty() || u64::try_from(bytes.len()).map_err(|_| ())? > MAX_STATE_BYTES {
             return Err(());
         }
         let temporary = self.directory.join(format!(".{job_id}.{}.tmp", Uuid::new_v4()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
+        options.mode(0o600);
         let mut file = options.open(&temporary).map_err(|_| ())?;
         let result = file
             .write_all(&bytes)
             .and_then(|()| file.sync_all())
-            .and_then(|()| fs::rename(&temporary, &destination))
+            .and_then(|()| fs::rename(&temporary, self.path(job_id)))
             .and_then(|()| sync_directory(&self.directory));
         if result.is_err() {
             let _ = fs::remove_file(temporary);
         }
         result.map_err(|_| ())
+    }
+
+    fn ensure_delivery_request_id(&self, result: &mut UploadedDiagnosticJobResult) -> Result<(), ()> {
+        match result.request_id.as_deref() {
+            Some(request_id) if valid_delivery_request_id(request_id) => Ok(()),
+            Some(_) => Err(()),
+            None => {
+                result.request_id = Some(Uuid::new_v4().to_string());
+                self.save(&result.job_id, &JobState::Uploaded(result.clone()))
+            }
+        }
+    }
+
+    // Delivered records are replay barriers only while a signed job could still
+    // be valid. Prune them only when the state-file cap is reached, not on every
+    // incoming job, and never prune pending or unreadable states.
+    #[cfg(test)]
+    fn prune_delivered_before(&self, cutoff: SystemTime) -> Result<Vec<String>, ()> {
+        let _guard = self.operation_lock.lock().map_err(|_| ())?;
+        self.ensure_directory()?;
+        self.prune_delivered_before_unlocked(cutoff)
+    }
+
+    fn prune_delivered_before_unlocked(&self, cutoff: SystemTime) -> Result<Vec<String>, ()> {
+        let mut removed = Vec::new();
+        for entry in fs::read_dir(&self.directory).map_err(|_| ())? {
+            let entry = entry.map_err(|_| ())?;
+            let name = entry.file_name();
+            let Some(filename) = name.to_str() else {
+                continue;
+            };
+            let Some(job_id) = filename.strip_suffix(".json") else {
+                continue;
+            };
+            // State files are keyed by canonical UUIDv7 job IDs. Ignore any
+            // unrelated or malformed files in this private directory.
+            let Ok(parsed_id) = Uuid::parse_str(job_id) else {
+                continue;
+            };
+            if parsed_id.get_version_num() != 7 || parsed_id.to_string() != job_id {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => metadata,
+                _ => continue,
+            };
+            match metadata.modified() {
+                Ok(modified) if modified <= cutoff => {}
+                _ => continue,
+            }
+            // Corrupt, unreadable, or untrusted files are deliberately retained.
+            // Cleanup must never turn an uncertain state into permission to rerun.
+            if !matches!(self.load_unlocked(job_id), Ok(Some(JobState::Delivered))) {
+                continue;
+            }
+            fs::remove_file(path).map_err(|_| ())?;
+            self.adjust_cached_state_file_count_unlocked(-1)?;
+            removed.push(job_id.to_owned());
+        }
+        if !removed.is_empty() {
+            sync_directory(&self.directory).map_err(|_| ())?;
+        }
+        Ok(removed)
+    }
+
+    // The operation lock must be held by the caller. The first call scans the
+    // directory; subsequent calls are O(1) until this process creates/removes a
+    // state file. Only this process may write to the private state directory.
+    fn cached_state_file_count_unlocked(&self) -> Result<usize, ()> {
+        let mut cached = self.state_file_count_cache.lock().map_err(|_| ())?;
+        if cached.is_none() {
+            *cached = Some(self.state_file_count()?);
+        }
+        cached.as_ref().copied().ok_or(())
+    }
+
+    // Positive values count successful creates; negative values count removals.
+    fn adjust_cached_state_file_count_unlocked(&self, delta: isize) -> Result<(), ()> {
+        let mut cached = self.state_file_count_cache.lock().map_err(|_| ())?;
+        if let Some(count) = cached.as_mut() {
+            let updated = if delta >= 0 {
+                count.checked_add(usize::try_from(delta).map_err(|_| ())?).ok_or(())?
+            } else {
+                count.checked_sub(delta.unsigned_abs()).ok_or(())?
+            };
+            *count = updated;
+        }
+        Ok(())
     }
 
     fn ensure_directory(&self) -> Result<(), ()> {
@@ -337,9 +515,6 @@ impl JobStateStore {
             let entry = entry.map_err(|_| ())?;
             if entry.file_name().to_string_lossy().ends_with(".json") {
                 count = count.checked_add(1).ok_or(())?;
-                if count >= MAX_STATE_FILES {
-                    break;
-                }
             }
         }
         Ok(count)
@@ -514,6 +689,7 @@ async fn prepare_result(
         let receipt = receipt?;
         UploadedDiagnosticJobResult {
             job_id: result.job_id,
+            request_id: Some(Uuid::new_v4().to_string()),
             outcome: result.outcome,
             reason: result.reason,
             artifact_name: Some(receipt.name),
@@ -522,6 +698,7 @@ async fn prepare_result(
     } else {
         UploadedDiagnosticJobResult {
             job_id: result.job_id,
+            request_id: Some(Uuid::new_v4().to_string()),
             outcome: result.outcome,
             reason: result.reason,
             artifact_name: None,
@@ -530,6 +707,7 @@ async fn prepare_result(
     };
     let state = JobState::Uploaded(uploaded.clone());
     if runtime.store.save(&uploaded.job_id, &state).is_err() {
+        tracing::error!(job_id = %uploaded.job_id, "failed to persist uploaded diagnostic result; result delivery was not started");
         return None;
     }
     if let Ok(mut states) = runtime.states.lock() {
@@ -547,10 +725,12 @@ async fn deliver_result(
     let Ok(transport) = TelemetryTransport::new(config.clone()) else {
         return false;
     };
-    let request_id = Uuid::new_v4().to_string();
+    let Some(request_id) = result.request_id.as_deref() else {
+        return false;
+    };
     let request = DiagnosticJobResultRequest {
         protocol_version: PROTOCOL_VERSION,
-        request_id: &request_id,
+        request_id,
         job_id: &result.job_id,
         outcome: &result.outcome,
         reason: &result.reason,
@@ -608,6 +788,7 @@ where
 
 fn valid_uploaded_result(result: &UploadedDiagnosticJobResult, job_id: &str) -> bool {
     result.job_id == job_id
+        && result.request_id.as_deref().map_or(true, valid_delivery_request_id)
         && valid_terminal_fields(&result.outcome, &result.reason)
         && match (&result.artifact_name, &result.artifact_sha256) {
             (Some(name), Some(digest)) => {
@@ -619,6 +800,10 @@ fn valid_uploaded_result(result: &UploadedDiagnosticJobResult, job_id: &str) -> 
             (None, None) => matches!(result.outcome.as_str(), "FAILED" | "UNSUPPORTED" | "CANCELLED"),
             _ => false,
         }
+}
+
+fn valid_delivery_request_id(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|uuid| uuid.get_version_num() == 4 && uuid.to_string() == value)
 }
 
 fn valid_terminal_fields(outcome: &str, reason: &str) -> bool {
@@ -762,9 +947,11 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let store = JobStateStore {
             directory: temporary.path().join("diagnostic-jobs"),
+            operation_lock: Arc::new(Mutex::new(())),
+            state_file_count_cache: Arc::new(Mutex::new(None)),
         };
         let job_id = Uuid::now_v7().to_string();
-        store.save(&job_id, &JobState::Active).expect("active state");
+        store.save_new(&job_id, &JobState::Active).expect("active state");
         assert!(matches!(store.load(&job_id), Ok(Some(JobState::Active))));
 
         let expected = execution(&job_id, b"bounded artifact");
@@ -780,6 +967,7 @@ mod tests {
 
         let uploaded = UploadedDiagnosticJobResult {
             job_id: job_id.clone(),
+            request_id: Some(Uuid::new_v4().to_string()),
             outcome: "SUCCEEDED".to_owned(),
             reason: "COMPLETE".to_owned(),
             artifact_name: Some(format!(
@@ -802,6 +990,213 @@ mod tests {
     }
 
     #[test]
+    fn state_store_does_not_recreate_or_overwrite_initial_records() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStateStore {
+            directory: temporary.path().join("diagnostic-jobs"),
+            operation_lock: Arc::new(Mutex::new(())),
+            state_file_count_cache: Arc::new(Mutex::new(None)),
+        };
+        let job_id = Uuid::now_v7().to_string();
+
+        assert!(store.save(&job_id, &JobState::Delivered).is_err());
+        assert!(matches!(store.load(&job_id), Ok(None)));
+
+        store.save_new(&job_id, &JobState::Active).expect("initial state");
+        assert!(store.save_new(&job_id, &JobState::Delivered).is_err());
+        assert!(matches!(store.load(&job_id), Ok(Some(JobState::Active))));
+    }
+
+    #[test]
+    fn delivered_state_pruning_preserves_pending_states() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStateStore {
+            directory: temporary.path().join("diagnostic-jobs"),
+            operation_lock: Arc::new(Mutex::new(())),
+            state_file_count_cache: Arc::new(Mutex::new(None)),
+        };
+        let delivered_id = Uuid::now_v7().to_string();
+        let active_id = Uuid::now_v7().to_string();
+        let uploaded_id = Uuid::now_v7().to_string();
+
+        store.save_new(&delivered_id, &JobState::Delivered).expect("delivered state");
+        store.save_new(&active_id, &JobState::Active).expect("active state");
+        let uploaded = UploadedDiagnosticJobResult {
+            job_id: uploaded_id.clone(),
+            request_id: Some(Uuid::new_v4().to_string()),
+            outcome: "FAILED".to_owned(),
+            reason: "COLLECTION_FAILED".to_owned(),
+            artifact_name: None,
+            artifact_sha256: None,
+        };
+        store
+            .save_new(&uploaded_id, &JobState::Uploaded(uploaded))
+            .expect("uploaded state");
+
+        let cutoff = SystemTime::now() + Duration::from_secs(1);
+        assert_eq!(store.prune_delivered_before(cutoff).expect("prune"), vec![delivered_id.clone()]);
+        assert!(matches!(store.load(&delivered_id), Ok(None)));
+        assert!(matches!(store.load(&active_id), Ok(Some(JobState::Active))));
+        assert!(matches!(store.load(&uploaded_id), Ok(Some(JobState::Uploaded(_)))));
+    }
+
+    #[test]
+    fn delivered_state_pruning_keeps_corrupt_and_non_job_files() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStateStore {
+            directory: temporary.path().join("diagnostic-jobs"),
+            operation_lock: Arc::new(Mutex::new(())),
+            state_file_count_cache: Arc::new(Mutex::new(None)),
+        };
+        let corrupt_id = Uuid::now_v7().to_string();
+        store
+            .save_new(&corrupt_id, &JobState::Delivered)
+            .expect("initial delivered state");
+        fs::write(store.path(&corrupt_id), b"not-json").expect("corrupt state file");
+        store.save_new("legacy", &JobState::Delivered).expect("non-UUID file name");
+
+        let old_time = std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH);
+        for path in [store.path(&corrupt_id), store.path("legacy")] {
+            File::options()
+                .write(true)
+                .open(path)
+                .expect("open state file")
+                .set_times(old_time)
+                .expect("age state file");
+        }
+
+        assert!(
+            store
+                .prune_delivered_before(SystemTime::now() + Duration::from_secs(1))
+                .expect("prune")
+                .is_empty()
+        );
+        assert!(store.path(&corrupt_id).is_file());
+        assert!(store.path("legacy").is_file());
+    }
+
+    #[test]
+    fn capacity_pruning_is_triggered_only_at_the_limit_and_returns_evicted_ids() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStateStore {
+            directory: temporary.path().join("diagnostic-jobs"),
+            operation_lock: Arc::new(Mutex::new(())),
+            state_file_count_cache: Arc::new(Mutex::new(None)),
+        };
+        let expired_delivered_id = Uuid::now_v7().to_string();
+        let active_id = Uuid::now_v7().to_string();
+        let below_capacity_id = Uuid::now_v7().to_string();
+        let at_capacity_id = Uuid::now_v7().to_string();
+        store
+            .save_new_with_limit(&expired_delivered_id, &JobState::Delivered, 4)
+            .expect("delivered state");
+        store
+            .save_new_with_limit(&active_id, &JobState::Active, 4)
+            .expect("active state");
+
+        let old_time = std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH);
+        File::options()
+            .write(true)
+            .open(store.path(&expired_delivered_id))
+            .expect("open delivered state")
+            .set_times(old_time)
+            .expect("age delivered state");
+
+        // With two files and a limit of three, the old Delivered record remains.
+        assert!(
+            store
+                .save_new_with_limit(&below_capacity_id, &JobState::Active, 3)
+                .expect("capacity available")
+                .is_empty()
+        );
+        assert!(matches!(store.load(&expired_delivered_id), Ok(Some(JobState::Delivered))));
+
+        // At the limit, only the expired Delivered replay barrier is reclaimed.
+        let evicted = store
+            .save_new_with_limit(&at_capacity_id, &JobState::Active, 3)
+            .expect("expired Delivered record reclaimed");
+        assert_eq!(evicted, vec![expired_delivered_id.clone()]);
+        assert!(matches!(store.load(&expired_delivered_id), Ok(None)));
+        assert!(matches!(store.load(&active_id), Ok(Some(JobState::Active))));
+        assert!(matches!(store.load(&below_capacity_id), Ok(Some(JobState::Active))));
+        assert!(matches!(store.load(&at_capacity_id), Ok(Some(JobState::Active))));
+    }
+
+    #[test]
+    fn state_capacity_fails_closed_when_only_pending_state_exists() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStateStore {
+            directory: temporary.path().join("diagnostic-jobs"),
+            operation_lock: Arc::new(Mutex::new(())),
+            state_file_count_cache: Arc::new(Mutex::new(None)),
+        };
+        let active_id = Uuid::now_v7().to_string();
+        let new_id = Uuid::now_v7().to_string();
+        store
+            .save_new_with_limit(&active_id, &JobState::Active, 1)
+            .expect("active state");
+
+        assert!(store.save_new_with_limit(&new_id, &JobState::Active, 1).is_err());
+        assert!(matches!(store.load(&active_id), Ok(Some(JobState::Active))));
+        assert!(matches!(store.load(&new_id), Ok(None)));
+    }
+
+    #[test]
+    fn delivery_request_id_requires_canonical_uuid_v4() {
+        let valid = Uuid::new_v4().to_string();
+        assert!(valid_delivery_request_id(&valid));
+        assert!(!valid_delivery_request_id(&valid.to_uppercase()));
+        assert!(!valid_delivery_request_id(&Uuid::now_v7().to_string()));
+        assert!(!valid_delivery_request_id("not-a-uuid"));
+    }
+
+    #[test]
+    fn legacy_uploaded_state_migrates_and_persists_stable_request_id() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let store = JobStateStore {
+            directory: temporary.path().join("diagnostic-jobs"),
+            operation_lock: Arc::new(Mutex::new(())),
+            state_file_count_cache: Arc::new(Mutex::new(None)),
+        };
+        let job_id = Uuid::now_v7().to_string();
+        let uploaded = UploadedDiagnosticJobResult {
+            job_id: job_id.clone(),
+            request_id: None,
+            outcome: "FAILED".to_owned(),
+            reason: "COLLECTION_FAILED".to_owned(),
+            artifact_name: None,
+            artifact_sha256: None,
+        };
+        store
+            .save_new(&job_id, &JobState::Uploaded(uploaded))
+            .expect("legacy uploaded state");
+
+        // Simulate a state file written by an older release, before requestId
+        // existed in UploadedDiagnosticJobResult.
+        let path = store.path(&job_id);
+        let mut legacy: serde_json::Value = serde_json::from_slice(&fs::read(&path).expect("read state")).expect("decode state");
+        legacy["result"].as_object_mut().expect("result object").remove("requestId");
+        fs::write(&path, serde_json::to_vec(&legacy).expect("encode legacy state")).expect("write legacy state");
+
+        let mut loaded = match store.load(&job_id).expect("load legacy state") {
+            Some(JobState::Uploaded(result)) => result,
+            _ => panic!("uploaded state expected"),
+        };
+        assert!(loaded.request_id.is_none());
+        store.ensure_delivery_request_id(&mut loaded).expect("migrate request id");
+        let request_id = loaded.request_id.clone().expect("request id");
+        assert!(valid_delivery_request_id(&request_id));
+
+        let reloaded = match store.load(&job_id).expect("reload migrated state") {
+            Some(JobState::Uploaded(result)) => result,
+            _ => panic!("uploaded state expected"),
+        };
+        assert_eq!(reloaded.request_id.as_deref(), Some(request_id.as_str()));
+        store.ensure_delivery_request_id(&mut loaded).expect("idempotent ensure");
+        assert_eq!(loaded.request_id.as_deref(), Some(request_id.as_str()));
+    }
+
+    #[test]
     fn persisted_result_must_match_job_and_artifact_digest() {
         let job_id = Uuid::now_v7().to_string();
         let mut result = execution(&job_id, b"artifact");
@@ -820,9 +1215,11 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let store = JobStateStore {
             directory: temporary.path().join("diagnostic-jobs"),
+            operation_lock: Arc::new(Mutex::new(())),
+            state_file_count_cache: Arc::new(Mutex::new(None)),
         };
         let job_id = Uuid::now_v7().to_string();
-        store.save(&job_id, &JobState::Active).expect("active state");
+        store.save_new(&job_id, &JobState::Active).expect("active state");
         fs::set_permissions(store.path(&job_id), fs::Permissions::from_mode(0o640)).expect("permissions");
         assert!(store.load(&job_id).is_err());
     }
